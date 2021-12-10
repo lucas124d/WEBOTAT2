@@ -1,0 +1,427 @@
+#include <stdio.h>
+#include <stdlib.h>
+
+#include <math.h>
+
+#include <webots/robot.h>
+#include <webots/motor.h>
+#include <webots/supervisor.h>
+#include <webots/distance_sensor.h>
+#include <webots/gps.h>
+#include <webots/compass.h>
+#include <webots/led.h>
+
+#define THETA_THRESHOLD 1 //Grau
+
+#define MAX_SPEED 6.28 //rad/s
+
+#define TANGENSIAL_SPEED 0.12874
+
+#define ROBOT_ROTATIONAL_SPEED 0.772881647
+
+#define ROBOT_ANGULAR_SPEED_IN_DEGREES 283.587111888
+
+#define BOX_THRESHOLD 0.30
+
+#define GPS_SAMPLING_PERIOD 1 //em milissegundos
+
+#define COMPASS_SAMPLING_PERIOD 1 //em milissegundos
+
+static WbDeviceTag left_motor, right_motor;
+
+WbDeviceTag gps;
+
+WbDeviceTag compass;
+
+WbNodeRef robot_node;
+
+WbNodeRef box_0_node, box_1_node, box_2_node,
+          box_3_node, box_4_node, box_5_node,
+          box_6_node, box_7_node, box_8_node;
+
+WbFieldRef trans_field[9];
+
+WbFieldRef rotac_field;
+
+WbDeviceTag led;
+
+WbDeviceTag ps[8];
+
+double ps_values[8];
+const double *robot_position;	
+const double *robot_rotation;
+
+int time_step;
+
+double boxes[9][2] = {
+  {-0.25,-0.25},  // Wooden box(0)
+  {-0.25,0},     // Wooden box(1)
+  {-0.25,0.25}, // Wooden box(2)
+  {0, -0.25},     // Wooden box(3)
+  {0, 0},        // Wooden box(4)
+  {0,0.25},     // Wooden box(5)
+  {0.25, -0.25},  // Wooden box(6)
+  {0.25,0},      // Wooden box(7)
+  {0.25,0.25}   // Wooden box(8)
+};
+
+int visited_boxes[9];
+
+int get_time_step(){
+  static int time_step = -1;
+  if (time_step == -1)
+    time_step = (int)wb_robot_get_basic_time_step();
+  
+  return time_step;
+}
+
+void step()
+{
+    if (wb_robot_step(time_step) == -1)
+    {
+        wb_robot_cleanup();
+        exit(EXIT_SUCCESS);
+    }
+}
+
+double getRobotBearing()
+{
+    const double *north = wb_compass_get_values(compass);
+    double rad = atan2(north[0], north[2]);
+    double bearing = (rad - 1.5708) / M_PI * 180.0;
+    if (bearing < 0.0) {
+        bearing = bearing + 360.0;
+	}
+	
+    return bearing;
+}
+
+bool target_box_moved(int target, const double current_coords[2]){
+  double x_diff = fabs(current_coords[0] - boxes[target][0]);
+  double y_diff = fabs(current_coords[1] - boxes[target][1]);
+  
+  if (x_diff > 0.01 || y_diff > 0.01)
+    return true;
+  else
+    return false;
+}
+
+double *convert_coords_to_cartesian(const double coordinates[3]){
+  double *coordenada_cartesiana = malloc(2);
+  coordenada_cartesiana[0] = coordinates[0];
+  coordenada_cartesiana[1] = -coordinates[2];
+  return coordenada_cartesiana;
+}
+
+double convert_heading_to_cartesian(double heading){	
+
+ heading = 360 - heading;
+ 
+  heading = heading + 90;
+
+  if (heading > 360.0)
+    heading = heading - 360;
+
+  return heading;
+}
+
+bool is_cartesian_theta_equal(const double theta, const double theta2){
+  if(fabs(theta-theta2) < THETA_THRESHOLD)
+    return true;
+  else
+    return false;
+}
+
+double calculate_destination_theta_in_degrees(const double robot_coord[2], const double dest_coord[2]){
+  return atan2(dest_coord[1] - robot_coord[1], dest_coord[0] - robot_coord[0]) * 180 / M_PI;
+}
+
+double calculate_robot_theta(double heading, double dest_theta){
+  double theta = dest_theta - heading;
+  printf("Dest_theta: %4.4f\nHeading: %4.4f\n",dest_theta,heading);
+  if (theta > 180)
+    theta = -(360-theta);
+  else if (theta < -180)
+    theta = (360+theta);
+
+  return theta;
+}
+
+double calculate_distance(const double robot_coord[2], const double dest_coord[2]){
+  return sqrt(pow(dest_coord[0] - robot_coord[0], 2) + pow(dest_coord[1] - robot_coord[1], 2));
+}
+
+double convert_heading_in_degrees(double heading_in_rad){
+  return heading_in_rad * 180 / M_PI;
+}
+
+int get_min_distance_box_info(const double robot_coord[2], double boxes[9][2], int visited_boxes[9]){
+  int i = 0;
+  double min_distance = 1000;
+  double temp = 0.0;
+  int caixa_alvo = 0;
+  printf("Caixas visitadas\n");
+  for (i = 0; i < 9; i++){
+    if(visited_boxes[i] == 0){
+      temp = calculate_distance(robot_coord, boxes[i]);
+      if (temp <= min_distance){
+        min_distance = temp;
+        caixa_alvo = i;
+      }
+    } 
+  }
+  return caixa_alvo;
+}
+
+void motor_stop(){
+  wb_motor_set_velocity(left_motor, 0);
+  wb_motor_set_velocity(right_motor, 0);
+}
+
+void motor_move_forward(){
+  wb_motor_set_velocity(left_motor, 0.53*MAX_SPEED);
+  wb_motor_set_velocity(right_motor, 0.53*MAX_SPEED);
+}
+
+void motor_rotate_left(){
+  wb_motor_set_velocity(left_motor, -0.53*MAX_SPEED);
+  wb_motor_set_velocity(right_motor, 0.53*MAX_SPEED);
+}
+
+void motor_rotate_right(){
+  wb_motor_set_velocity(left_motor, 0.53*MAX_SPEED);
+  wb_motor_set_velocity(right_motor, -0.53*MAX_SPEED);
+}
+
+
+void rotate_to_box(const double theta){
+  
+  if (!is_cartesian_theta_equal(theta,0)){
+    double duration = abs(theta) / (ROBOT_ANGULAR_SPEED_IN_DEGREES * 0.6);	
+    if(theta>0)
+      motor_rotate_left();
+    else if (theta < 0)
+      motor_rotate_right();
+
+    double start_time = wb_robot_get_time();
+    do{
+      step();
+    }while (wb_robot_get_time() < start_time + duration);	
+  }
+}
+
+void move_forward(double distance){
+
+  double duration = (distance*0.8) / TANGENSIAL_SPEED;
+  printf("Duração até o destino: %4.4f\n", duration);
+
+  motor_move_forward();
+
+  double start_time = wb_robot_get_time();
+  do{
+    step();
+  }while (wb_robot_get_time() < start_time + duration);
+        
+  motor_stop();
+}
+
+void move_robot_special(double distance, int option){
+  
+  double duration = 0.0;
+  if (option == 1){
+    duration = (distance*0.8) / TANGENSIAL_SPEED;
+    printf("Duração até o destino: %4.4f\n", duration);
+    motor_move_forward();
+  }
+  else if (option == 2){
+    duration = distance / (ROBOT_ANGULAR_SPEED_IN_DEGREES * 0.6);
+    motor_rotate_left();
+  }
+  else if (option == 3){
+    duration = distance / (ROBOT_ANGULAR_SPEED_IN_DEGREES * 0.6);
+    motor_rotate_right();
+  }
+
+  double start_time = wb_robot_get_time();
+  do{
+    step();
+  }while (wb_robot_get_time() < start_time + duration);
+        
+           //motor_stop();
+}
+
+
+void init(){
+  time_step = get_time_step();
+	
+  char ps_names[8][4] ={
+    "ps0", "ps1", "ps2", "ps3",
+    "ps4", "ps5", "ps6", "ps7"
+  };
+  
+  led = wb_robot_get_device("led0");
+  
+  for (int i = 0; i < 8 ; i++) {
+    ps[i] = wb_robot_get_device(ps_names[i]);
+            
+    wb_distance_sensor_enable(ps[i], time_step);
+  }
+    
+  left_motor = wb_robot_get_device("left wheel motor");
+  right_motor = wb_robot_get_device("right wheel motor");
+  wb_motor_set_position(left_motor, INFINITY);
+  wb_motor_set_position(right_motor, INFINITY);
+  wb_motor_set_velocity(left_motor, 0.0);
+  wb_motor_set_velocity(right_motor, 0.0);
+
+  robot_node = wb_supervisor_node_get_from_def("e-Puck");
+  
+  box_0_node = wb_supervisor_node_get_from_def("Caixa0");
+  box_1_node = wb_supervisor_node_get_from_def("Caixa1");
+  box_2_node = wb_supervisor_node_get_from_def("Caixa2");
+  box_3_node = wb_supervisor_node_get_from_def("Caixa3");
+  box_4_node = wb_supervisor_node_get_from_def("Caixa4");
+  box_5_node = wb_supervisor_node_get_from_def("Caixa5");
+  box_6_node = wb_supervisor_node_get_from_def("Caixa6");
+  box_7_node = wb_supervisor_node_get_from_def("Caixa7");
+  box_8_node = wb_supervisor_node_get_from_def("Caixa8");
+  
+  trans_field[0] = wb_supervisor_node_get_proto_field(box_0_node,"translation");
+  trans_field[1] = wb_supervisor_node_get_proto_field(box_1_node,"translation");
+  trans_field[2] = wb_supervisor_node_get_proto_field(box_2_node,"translation");
+  trans_field[3] = wb_supervisor_node_get_proto_field(box_3_node,"translation");
+  trans_field[4] = wb_supervisor_node_get_proto_field(box_4_node,"translation");
+  trans_field[5] = wb_supervisor_node_get_proto_field(box_5_node,"translation");
+  trans_field[6] = wb_supervisor_node_get_proto_field(box_6_node,"translation");
+  trans_field[7] = wb_supervisor_node_get_proto_field(box_7_node,"translation");
+  trans_field[8] = wb_supervisor_node_get_proto_field(box_8_node,"translation");
+          
+}
+
+int main(int argc, char **argv){
+  wb_robot_init();
+
+  init();
+
+  int target = -1;
+
+  int error_counter = 0;
+  
+  int collision_counter = 0;
+  	
+  double *current_coord;
+  double theta_destination;
+  double robot_heading;
+  double destination_distance;
+  double theta_dot;
+  double *box_pos;
+  
+  double boxes_current[9][2];
+  
+  gps = wb_robot_get_device("gps");
+  wb_gps_enable(gps, GPS_SAMPLING_PERIOD);
+
+  compass = wb_robot_get_device("compass");
+  wb_compass_enable(compass, COMPASS_SAMPLING_PERIOD);
+	
+  while(true){
+  
+    
+    wb_led_set(led, 0);
+    
+    for (int i = 0; i < 8 ; i++){
+      ps_values[i] = wb_distance_sensor_get_value(ps[i]);
+      box_pos = convert_coords_to_cartesian(wb_supervisor_field_get_sf_vec3f(trans_field[i]));
+      
+      boxes_current[i][0] = roundf(box_pos[0] * 100) / 100;
+      boxes_current[i][1] = roundf(box_pos[1] * 100) / 100;
+                   
+      printf("Node Caixa %d: X = %4.4f Y = %4.4f \n", i, boxes_current[i][0], boxes_current[i][1]);
+      
+    }
+    		
+    bool right_obstacle =  ps_values[0] > 140.0 ||
+                          ps_values[1] > 140.0;
+    bool left_obstacle =   ps_values[6] > 140.0 ||
+                          ps_values[7] > 140.0;
+                       
+    current_coord = convert_coords_to_cartesian(wb_gps_get_values(gps));
+
+    if(target == -1){
+      error_counter = 0;
+      target = get_min_distance_box_info(current_coord, boxes, visited_boxes);
+      printf("Entidade X | Y\nRobô: %4.4f | %4.4f\nCaixa Destino: %d \n\t %4.4f | %4.4f\n",
+            current_coord[0], current_coord[1], target, boxes[target][0], boxes[target][1]
+	 );	
+		
+
+      //theta_destination = calculate_destination_theta_in_degrees(current_coord, boxes[target]);
+      robot_heading = convert_heading_to_cartesian(getRobotBearing());
+      
+      theta_destination = calculate_destination_theta_in_degrees(current_coord, boxes[target]);
+      
+      printf("Theta antes de calcular: %4.4f\n", theta_destination);
+      
+      theta_dot = calculate_robot_theta(robot_heading, theta_destination);
+            
+      printf("Theta p/ Destino: %4.4f\n", theta_dot);
+      
+      rotate_to_box(theta_dot);
+                
+      destination_distance = calculate_distance(current_coord, boxes[target]);
+                
+      printf("Distância até o destino: %4.4f\n", destination_distance);
+              
+      move_forward(destination_distance);
+      
+    }
+    
+    destination_distance = calculate_distance(current_coord, boxes[target]);
+		
+    if(right_obstacle || left_obstacle){
+       
+      if(target_box_moved(target, boxes_current[target])){
+        printf("TARGET: %d, BOXES X: %4.4f Y: %4.4f \n", target, boxes_current[target][0], boxes_current[target][1]);
+        wb_led_set(led, 1);
+      }
+               		  
+      if (destination_distance <= 0.1){
+        visited_boxes[target] = 1;
+        collision_counter = 0;
+        printf(">>>>>>>>>>> COLISÃO <<<<<<<<<<\n");
+      }
+             
+      if(left_obstacle && right_obstacle){
+        printf("Colisão frontal\n");
+        move_robot_special(180,2);
+      }
+      else if(left_obstacle){
+        printf("Colisão esquerda\n");
+        collision_counter += 1;
+        move_robot_special(30,3);
+      }
+      else if(right_obstacle){
+        printf("Colisão direita\n");
+        collision_counter += 1;
+        move_robot_special(30,2);
+      } 
+      move_robot_special(0.2,1);
+      target = -1;
+    }
+    
+    if (collision_counter >= 3){
+      printf(">>>> Colisão repetitiva: Recalculando rota\n");
+      move_robot_special(90,3);
+      move_robot_special(0.2,1);
+      target = -1;
+    }
+                      
+    if (error_counter > 10){
+      printf("Recalculando rota\n");
+      target = -1;
+    }
+    
+    error_counter += 1;
+    step();                                    
+  }
+}
